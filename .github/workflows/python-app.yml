@@ -1,0 +1,134 @@
+name: CI/CD FastAPI - Homologação e Produção
+
+on:
+  push:
+    branches:
+      - develop
+      - main
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+  CONTAINER_NAME: fastapi-app
+
+jobs:
+  build:
+    name: Build e Testes
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Instalar dependências
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Executar testes automatizados
+        run: pytest -v
+
+  imagem:
+    name: Build e Push da Imagem Docker
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Login no GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build e Push da Imagem Docker
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+
+  deploy_homologacao:
+    name: Deploy Homologação (Automático)
+    needs: imagem
+    if: github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    environment:
+      name: homologacao
+
+    steps:
+      - name: Configurar chave SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.HOMOL_EC2_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "${{ secrets.HOMOL_EC2_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Deploy do container em Homologação (porta 8080)
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | ssh "${{ secrets.HOMOL_EC2_USERNAME }}@${{ secrets.HOMOL_EC2_HOST }}" \
+            "docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin"
+
+          ssh "${{ secrets.HOMOL_EC2_USERNAME }}@${{ secrets.HOMOL_EC2_HOST }}" << 'EOF'
+            docker pull "${{ env.IMAGE_NAME }}:${{ github.sha }}"
+            docker stop "${{ env.CONTAINER_NAME }}-homol" || true
+            docker rm "${{ env.CONTAINER_NAME }}-homol" || true
+            docker run -d \
+              --name "${{ env.CONTAINER_NAME }}-homol" \
+              --restart unless-stopped \
+              -p 8080:8000 \
+              -e ENVIRONMENT=homologacao \
+              "${{ env.IMAGE_NAME }}:${{ github.sha }}"
+            sleep 3
+            curl -fsS http://localhost:8080/health
+          EOF
+
+  Deploy_Producao:
+    name: Deploy Produção (Aprovação Manual)
+    needs: imagem
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: producao
+
+    steps:
+      - name: Configurar chave SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Deploy do container em Produção (porta 80)
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | ssh "${{ secrets.EC2_USERNAME }}@${{ secrets.EC2_HOST }}" \
+            "docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin"
+
+          ssh "${{ secrets.EC2_USERNAME }}@${{ secrets.EC2_HOST }}" << 'EOF'
+            docker pull "${{ env.IMAGE_NAME }}:${{ github.sha }}"
+            docker stop "${{ env.CONTAINER_NAME }}-prd" || true
+            docker rm "${{ env.CONTAINER_NAME }}-prd" || true
+            docker run -d \
+              --name "${{ env.CONTAINER_NAME }}-prd" \
+              --restart unless-stopped \
+              -p 80:8000 \
+              -e ENVIRONMENT=producao \
+              "${{ env.IMAGE_NAME }}:${{ github.sha }}"
+            sleep 3
+            curl -fsS http://localhost/health
+          EOF
