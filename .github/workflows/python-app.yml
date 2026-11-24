@@ -33,7 +33,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Executar testes automatizados
-        run: pytest -v
+        run: python -m pytest -v
 
   imagem:
     name: Build e Push da Imagem Docker
